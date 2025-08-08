@@ -188,11 +188,50 @@ Keep it tight with bullets; no fluff.
         logger.exception("Error in /analyze")
         await update.message.reply_text(f"Error in /analyze: {e}")
 
+# List what the bot has cached from TradingView
+async def latest_cmd(update, context: ContextTypes.DEFAULT_TYPE):
+    if not LATEST:
+        await update.message.reply_text("LATEST cache is empty. Waiting for TV alerts.")
+        return
+    lines = ["Cached symbols/timeframes:"]
+    for sym, tfs in LATEST.items():
+        lines.append(f"- {sym}: {', '.join(sorted(tfs.keys()))}")
+    await update.message.reply_text("\n".join(lines))
+
+# Run analysis without calling OpenAI (to isolate errors)
+async def analyzebare_cmd(update, context: ContextTypes.DEFAULT_TYPE):
+    data = LAST_PAYLOAD
+    if not data:
+        await update.message.reply_text("No LAST_PAYLOAD yet. Let a TV alert fire first.")
+        return
+    sym   = data.get("symbol")
+    tf_in = str(data.get("timeframe"))
+    price = data.get("price")
+    rsi   = data.get("rsi")
+    ema20 = data.get("ema20") or data.get("ema_fast")
+    ema50 = data.get("ema50") or data.get("ema_slow")
+    macd  = data.get("macd")
+    macds = data.get("macd_signal")
+    macdh = data.get("macd_hist")
+    atr   = data.get("atr")
+    msg = (
+        "🔎 Bare analysis payload (no OpenAI)\n"
+        f"• {sym} ({tf_in})\n"
+        f"• Price: {price}\n"
+        f"• RSI: {rsi} | EMA20: {ema20} | EMA50: {ema50}\n"
+        f"• MACD: {macd}/{macds}/{macdh} | ATR: {atr}\n"
+        "If this shows, /analyze should work once OpenAI is okay."
+    )
+    await update.message.reply_text(msg)
+
 # Register command handlers
 tg_app.add_handler(CommandHandler("start", start))
 tg_app.add_handler(CommandHandler("ping", ping))
 tg_app.add_handler(CommandHandler("chatid", chatid))
 tg_app.add_handler(CommandHandler("analyze", analyze_cmd))
+tg_app.add_handler(CommandHandler("latest", latest_cmd))
+tg_app.add_handler(CommandHandler("analyzebare", analyzebare_cmd))
+
 
 # -------------------- Routes --------------------
 @app.get("/health")
