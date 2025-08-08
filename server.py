@@ -1,5 +1,5 @@
 # server.py
-import os, json, re, asyncio, logging
+import os, json, re, logging, threading, asyncio
 from collections import defaultdict
 
 from flask import Flask, request
@@ -12,10 +12,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wingman-bot")
 
 # -------------------- Env Vars --------------------
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-assert TOKEN, "Missing TELEGRAM_TOKEN env var"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+assert TELEGRAM_TOKEN, "Missing TELEGRAM_TOKEN env var"
 
-CHAT_ID_ENV = os.environ.get("CHAT_ID")  # string or None; validated at use-time
 ALERT_SECRET = os.environ.get("ALERT_SECRET")
 assert ALERT_SECRET, "Missing ALERT_SECRET env var"
 
@@ -24,23 +23,36 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 # -------------------- Flask App --------------------
 app = Flask(__name__)
 
-# -------------------- Telegram App --------------------
-tg_app = Application.builder().token(TOKEN).build()
+# -------------------- Dedicated asyncio loop (fixes 'Event loop is closed') --------------------
+LOOP = asyncio.new_event_loop()
+def _loop_runner():
+    asyncio.set_event_loop(LOOP)
+    LOOP.run_forever()
+threading.Thread(target=_loop_runner, daemon=True).start()
 
-# Flag to ensure PTB app is started once
+# -------------------- Telegram App (PTB v21) --------------------
+tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+
 _initialized = False
 def ensure_initialized_once():
-    """Initialize & start PTB v21 Application exactly once."""
+    """Initialize & start PTB on the dedicated loop exactly once."""
     global _initialized
     if not _initialized:
-        logger.info("Initializing Telegram application…")
-        asyncio.run(tg_app.initialize())
-        asyncio.run(tg_app.start())
+        logging.info("Initializing Telegram application on background loop…")
+        fut = asyncio.run_coroutine_threadsafe(tg_app.initialize(), LOOP)
+        fut.result()
+        fut = asyncio.run_coroutine_threadsafe(tg_app.start(), LOOP)
+        fut.result()
         _initialized = True
-        logger.info("Telegram application initialized & started.")
+        logging.info("Telegram application initialized & started.")
+
+def _chat_id_or_raise() -> int:
+    chat_id = os.environ.get("CHAT_ID")
+    assert chat_id, "CHAT_ID is not set in environment"
+    return int(chat_id)
 
 # -------------------- OpenAI Client --------------------
-# Uses OPENAI_API_KEY from env; will raise if missing when called
+# Uses OPENAI_API_KEY from environment
 client = OpenAI()
 
 # -------------------- Helpers --------------------
@@ -75,262 +87,10 @@ def _norm_tf(x):
              .replace("1HOUR","1H")
              or "240")
 
-def _chat_id_or_raise():
-    chat_id = os.environ.get("CHAT_ID")
-    assert chat_id, "CHAT_ID is not set in environment"
-    return int(chat_id)
-
-# -------------------- Command Handlers --------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            "✅ Wingman bot is alive.\n"
-            "Commands:\n"
-            "• /ping — quick test\n"
-            "• /chatid — show this chat id\n"
-            "• /analyze [SYMBOL] [TF] — analyze latest TA (e.g., /analyze BINANCE:PYTHUSDT 240)\n"
-            "Tip: keep TradingView alerts running so I always have fresh TA cached."
-        )
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text("🏓 Pong!")
-
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(f"Your chat_id is: {update.message.chat_id}")
-
-# Cache of latest TA by symbol & timeframe; and most recent payload overall
-LATEST = defaultdict(dict)   # LATEST["BINANCE:PYTHUSDT"]["240"] = {payload}
+# -------------------- Caches --------------------
+# Latest TA by symbol & timeframe; and most recent payload overall
+LATEST = defaultdict(dict)   # LATEST["BINANCE:PYTHUSDT"]["240"] = payload dict
 LAST_PAYLOAD = None
 
-async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Analyze the latest cached TA using OpenAI and return an actionable plan."""
-    try:
-        args = context.args
-        symbol = tf = None
-
-        if len(args) >= 1:
-            symbol = args[0].upper()
-        if len(args) >= 2:
-            tf = _norm_tf(args[1])
-
-        # Choose which payload to analyze
-        data = None
-        if symbol and tf:
-            data = LATEST.get(symbol, {}).get(tf)
-        elif symbol:
-            if "240" in LATEST.get(symbol, {}):
-                data = LATEST[symbol]["240"]
-            else:
-                tfs = list(LATEST.get(symbol, {}).keys())
-                data = LATEST[symbol][tfs[0]] if tfs else None
-        else:
-            data = LAST_PAYLOAD
-
-        if not data:
-            await update.message.reply_text(
-                "No cached TradingView data yet for that request.\n"
-                "Usage: /analyze <SYMBOL> [TF]\n"
-                "Example: /analyze BINANCE:PYTHUSDT 240\n"
-                "Tip: create a TradingView alert for that symbol/timeframe and wait for the next bar close."
-            )
-            return
-
-        # Extract values safely
-        sym   = data.get("symbol", "UNKNOWN")
-        tf_in = str(data.get("timeframe", "NA"))
-        price = _to_float_or_none(data.get("price"))
-        rsi   = _to_float_or_none(data.get("rsi"))
-        ema20 = _to_float_or_none(data.get("ema20") or data.get("ema_fast"))
-        ema50 = _to_float_or_none(data.get("ema50") or data.get("ema_slow"))
-        macd  = _to_float_or_none(data.get("macd"))
-        macds = _to_float_or_none(data.get("macd_signal"))
-        macdh = _to_float_or_none(data.get("macd_hist"))
-        atr   = _to_float_or_none(data.get("atr"))
-
-        # Build the analysis prompt
-        system_msg = "You are Wingman, a precise, risk-aware crypto TA analyst. Be concise and actionable."
-        user_msg = f"""
-Analyze the following technicals and provide a concise, high-conviction plan.
-
-Symbol: {sym}
-Timeframe: {tf_in}
-Price: {price}
-RSI(14): {rsi}
-EMA20: {ema20}
-EMA50: {ema50}
-MACD: {macd}
-MACD Signal: {macds}
-MACD Hist: {macdh}
-ATR: {atr}
-
-Return:
-- Market structure & trend (bullish/bearish/range) + confidence (0–100%).
-- Entry plan: immediate vs. pullback; give exact levels.
-- Invalidation/stop-loss based on structure or ATR.
-- TP ladder: 3–5 targets with reasoning.
-- Risk notes: key risks and what invalidates the idea quickly.
-Keep it tight with bullets; no fluff.
-"""
-
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg}
-            ],
-            temperature=0.2,
-        )
-        text = resp.choices[0].message.content.strip()
-        await update.message.reply_text(text)
-    except Exception as e:
-        logger.exception("Error in /analyze")
-        await update.message.reply_text(f"Error in /analyze: {e}")
-
-# List what the bot has cached from TradingView
-async def latest_cmd(update, context: ContextTypes.DEFAULT_TYPE):
-    if not LATEST:
-        await update.message.reply_text("LATEST cache is empty. Waiting for TV alerts.")
-        return
-    lines = ["Cached symbols/timeframes:"]
-    for sym, tfs in LATEST.items():
-        lines.append(f"- {sym}: {', '.join(sorted(tfs.keys()))}")
-    await update.message.reply_text("\n".join(lines))
-
-# Run analysis without calling OpenAI (to isolate errors)
-async def analyzebare_cmd(update, context: ContextTypes.DEFAULT_TYPE):
-    data = LAST_PAYLOAD
-    if not data:
-        await update.message.reply_text("No LAST_PAYLOAD yet. Let a TV alert fire first.")
-        return
-    sym   = data.get("symbol")
-    tf_in = str(data.get("timeframe"))
-    price = data.get("price")
-    rsi   = data.get("rsi")
-    ema20 = data.get("ema20") or data.get("ema_fast")
-    ema50 = data.get("ema50") or data.get("ema_slow")
-    macd  = data.get("macd")
-    macds = data.get("macd_signal")
-    macdh = data.get("macd_hist")
-    atr   = data.get("atr")
-    msg = (
-        "🔎 Bare analysis payload (no OpenAI)\n"
-        f"• {sym} ({tf_in})\n"
-        f"• Price: {price}\n"
-        f"• RSI: {rsi} | EMA20: {ema20} | EMA50: {ema50}\n"
-        f"• MACD: {macd}/{macds}/{macdh} | ATR: {atr}\n"
-        "If this shows, /analyze should work once OpenAI is okay."
-    )
-    await update.message.reply_text(msg)
-
-# Register command handlers
-tg_app.add_handler(CommandHandler("start", start))
-tg_app.add_handler(CommandHandler("ping", ping))
-tg_app.add_handler(CommandHandler("chatid", chatid))
-tg_app.add_handler(CommandHandler("analyze", analyze_cmd))
-tg_app.add_handler(CommandHandler("latest", latest_cmd))
-tg_app.add_handler(CommandHandler("analyzebare", analyzebare_cmd))
-
-
-# -------------------- Routes --------------------
-@app.get("/health")
-def health():
-    return "ok", 200
-
-@app.post("/webhook")
-def telegram_webhook():
-    """Telegram will POST updates here (webhook)."""
-    try:
-        ensure_initialized_once()
-        data = request.get_json(force=True, silent=True)
-        if not data:
-            return "no json", 400
-        update = Update.de_json(data, tg_app.bot)
-        asyncio.run(tg_app.process_update(update))
-        return "ok", 200
-    except Exception as e:
-        logger.exception("Error handling /webhook")
-        return f"error: {e}", 500
-
-@app.get("/tv/test")
-def tv_test():
-    """Quick GET to verify CHAT_ID + bot send."""
-    try:
-        ensure_initialized_once()
-        chat_id = _chat_id_or_raise()
-        asyncio.run(tg_app.bot.send_message(chat_id=chat_id, text="✅ /tv/test reached OK"))
-        return "ok", 200
-    except Exception as e:
-        logger.exception("Error in /tv/test")
-        return f"error: {e}", 500
-
-@app.post("/tv")
-def tv_webhook():
-    """
-    TradingView Webhook endpoint.
-    Expects a JSON body containing:
-      - secret (must match ALERT_SECRET)
-      - symbol, timeframe, price, rsi, ema20/ema50 or ema_fast/ema_slow, macd, macd_signal, macd_hist, atr, note
-    """
-    try:
-        ensure_initialized_once()
-
-        # Log partial body for debugging (safe)
-        raw = request.get_data(as_text=True) or ""
-        logger.info(f"/tv raw (trunc): {raw[:500]}")
-
-        # Accept JSON only
-        try:
-            payload = json.loads(raw)
-        except Exception as e:
-            logger.exception("JSON parse error on /tv")
-            return f"bad json: {e}", 400
-
-        # Secret check
-        if payload.get("secret") != ALERT_SECRET:
-            logger.warning("Unauthorized /tv attempt (secret mismatch)")
-            return "unauthorized", 401
-
-        # Normalize & cache
-        symbol = payload.get("symbol", "UNKNOWN")
-        tf     = str(payload.get("timeframe", "NA")).upper()
-
-        # Save to cache
-        LATEST[symbol][tf] = payload
-        global LAST_PAYLOAD
-        LAST_PAYLOAD = payload
-
-        # Prepare a concise confirmation to Telegram
-        price  = _to_float_or_none(payload.get("price"))
-        rsi    = _to_float_or_none(payload.get("rsi"))
-        ema20  = _to_float_or_none(payload.get("ema20") or payload.get("ema_fast"))
-        ema50  = _to_float_or_none(payload.get("ema50") or payload.get("ema_slow"))
-        macd   = _to_float_or_none(payload.get("macd"))
-        macds  = _to_float_or_none(payload.get("macd_signal"))
-        macdh  = _to_float_or_none(payload.get("macd_hist"))
-        atr    = _to_float_or_none(payload.get("atr"))
-        note   = payload.get("note", "")
-
-        msg = (
-            "📡 TV Alert received\n"
-            f"• {symbol} ({tf})\n"
-            f"• Price: {price}\n"
-            f"• RSI: {rsi} | EMA20: {ema20} | EMA50: {ema50}\n"
-            f"• MACD: {macd}/{macds}/{macdh} | ATR: {atr}\n"
-            f"{'• Note: ' + note if note else ''}\n\n"
-            f"Tip: /analyze {symbol} {tf}"
-        )
-
-        chat_id = _chat_id_or_raise()
-        asyncio.run(tg_app.bot.send_message(chat_id=chat_id, text=msg))
-        return "ok", 200
-
-    except Exception as e:
-        logger.exception("Error in /tv")
-        return f"error: {e}", 500
-
-# -------------------- Entrypoint --------------------
-if __name__ == "__main__":
-    ensure_initialized_once()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+# -------------------- Command Handlers --------------------
+async def start(update: Update, context: ContextTypes.DEFAUL
