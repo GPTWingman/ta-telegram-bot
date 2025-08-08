@@ -66,6 +66,53 @@ def webhook():
         logger.exception("Error handling webhook")
         return f"error: {e}", 500
 
+import json
+from telegram.constants import ParseMode
+
+@app.post("/tv")
+def tv_webhook():
+    try:
+        ensure_initialized_once()
+        payload = request.get_json(force=True, silent=True)
+        if not payload:
+            return "no json", 400
+
+        # Basic auth via shared secret inside the JSON
+        secret = os.environ.get("ALERT_SECRET")
+        if not secret or payload.get("secret") != secret:
+            return "unauthorized", 401
+
+        # Extract fields (tolerant to missing keys)
+        symbol = payload.get("symbol", "UNKNOWN")
+        tf = payload.get("timeframe", "NA")
+        price = payload.get("price")
+        rsi = payload.get("rsi")
+        macd = payload.get("macd")
+        macdsig = payload.get("macd_signal")
+        macdhist = payload.get("macd_hist")
+        ema20 = payload.get("ema20")
+        ema50 = payload.get("ema50")
+        atr = payload.get("atr")
+        note = payload.get("note", "")
+
+        msg = (
+            f"📡 *TV Alert*\n"
+            f"• Symbol: *{symbol}*  ({tf})\n"
+            f"• Price: `{price}`\n"
+            f"• RSI(14): `{rsi}`\n"
+            f"• MACD: `{macd}`  Sig: `{macdsig}`  Hist: `{macdhist}`\n"
+            f"• EMA20: `{ema20}`  EMA50: `{ema50}`\n"
+            f"• ATR: `{atr}`\n"
+            f"{'• Note: ' + note if note else ''}"
+        )
+
+        chat_id = int(os.environ["CHAT_ID"])
+        asyncio.run(tg_app.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN))
+        return "ok", 200
+    except Exception as e:
+        app.logger.exception("Error in /tv")
+        return f"error: {e}", 500
+
 # --- Local dev runner (not used on Render) ---
 if __name__ == "__main__":
     ensure_initialized_once()
