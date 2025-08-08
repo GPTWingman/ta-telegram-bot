@@ -29,8 +29,10 @@ def webhook():
     if not data:
         return "no json", 400
     update = Update.de_json(data, tg_app.bot)
-    tg_app.update_queue.put_nowait(update)
+    import asyncio
+    asyncio.run(tg_app.process_update(update))
     return "ok", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
