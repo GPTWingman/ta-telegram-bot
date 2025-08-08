@@ -26,8 +26,13 @@ async def ping(update: Update, _):
     if update.message:
         await update.message.reply_text("🏓 Pong!")
 
+async def chatid(update: Update, _):
+    if update.message:
+        await update.message.reply_text(f"Your chat_id is: {update.message.chat_id}")
+
 tg_app.add_handler(CommandHandler("start", start))
 tg_app.add_handler(CommandHandler("ping", ping))
+tg_app.add_handler(CommandHandler("chatid", chatid))
 
 # --- Initialize & start the Telegram app once at startup ---
 # PTB v21 requires initialize() before using process_update()
