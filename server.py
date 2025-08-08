@@ -69,6 +69,18 @@ def webhook():
 import json
 from telegram.constants import ParseMode
 
+@app.get("/tv/test")
+def tv_test():
+    try:
+        ensure_initialized_once()
+        chat_id = int(os.environ["CHAT_ID"])
+        asyncio.run(tg_app.bot.send_message(chat_id=chat_id, text="✅ /tv/test reached OK"))
+        return "ok", 200
+    except Exception as e:
+        app.logger.exception("Error in /tv/test")
+        return f"error: {e}", 500
+
+
 @app.post("/tv")
 def tv_webhook():
     try:
