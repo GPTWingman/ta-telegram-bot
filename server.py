@@ -1,119 +1,164 @@
-import os
-import logging
-import asyncio
+# server.py — Simple & stable TradingView -> Telegram forwarder
+# No async. No event loops. Just works.
+
+import os, json, re, logging
+import requests
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, CommandHandler
 
-# --- Logging (so Render shows stack traces) ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("wingman-simple")
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-assert TOKEN, "Missing TELEGRAM_TOKEN env var"
+# ===== Env vars (set these on Render) =====
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")   # from BotFather
+CHAT_ID        = os.environ.get("CHAT_ID")          # your chat id number
+ALERT_SECRET   = os.environ.get("ALERT_SECRET")     # must match TradingView alert "secret"
 
 app = Flask(__name__)
 
-# Build Telegram application (async)
-tg_app = Application.builder().token(TOKEN).build()
-
-# --- Command handlers ---
-async def start(update: Update, _):
-    if update.message:
-        await update.message.reply_text("✅ Bot is alive. Send /ping to test.")
-
-async def ping(update: Update, _):
-    if update.message:
-        await update.message.reply_text("🏓 Pong!")
-
-async def chatid(update: Update, _):
-    if update.message:
-        await update.message.reply_text(f"Your chat_id is: {update.message.chat_id}")
-
-tg_app.add_handler(CommandHandler("start", start))
-tg_app.add_handler(CommandHandler("ping", ping))
-tg_app.add_handler(CommandHandler("chatid", chatid))
-
-# --- Initialize & start the Telegram app once at startup ---
-# PTB v21 requires initialize() before using process_update()
-_initialized = False
-def ensure_initialized_once():
-    global _initialized
-    if not _initialized:
-        logger.info("Initializing Telegram application…")
-        asyncio.run(tg_app.initialize())
-        asyncio.run(tg_app.start())
-        _initialized = True
-        logger.info("Telegram application initialized & started.")
-
-# --- Health check ---
+# ----- Basic routes -----
 @app.get("/health")
 def health():
     return "ok", 200
 
-# --- Telegram webhook endpoint ---
-@app.post("/webhook")
-def webhook():
+@app.get("/tv/test")
+def tv_test():
+    """Send a simple test message to Telegram (good for sanity checks)."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return "Missing TELEGRAM_TOKEN or CHAT_ID", 500
+    send_telegram(f"✅ Test OK\nService is alive.")
+    return "ok", 200
+
+# ----- Helper functions -----
+def send_telegram(text: str):
+    """Send a message to Telegram using the Bot API (plain HTTP)."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": int(CHAT_ID), "text": text}
     try:
-        ensure_initialized_once()
-        data = request.get_json(force=True, silent=True)
-        if not data:
-            return "no json", 400
-        update = Update.de_json(data, tg_app.bot)
-        asyncio.run(tg_app.process_update(update))
-        return "ok", 200
+        r = requests.post(url, json=payload, timeout=10)
+        if not r.ok:
+            logger.error("Telegram send failed: %s %s", r.status_code, r.text)
     except Exception as e:
-        logger.exception("Error handling webhook")
-        return f"error: {e}", 500
+        logger.exception("Telegram send exception: %s", e)
 
-import json
-from telegram.constants import ParseMode
+def _clean_num(v, decimals=6, allow_dash=True):
+    """Turn strings like 'na', '', ' 1,234.5 ' into nice numbers; or '—'."""
+    if v is None:
+        return "—" if allow_dash else ""
+    if isinstance(v, (int, float)):
+        try:
+            return f"{float(v):.{decimals}f}"
+        except:
+            return "—" if allow_dash else ""
+    s = str(v).strip().lower()
+    if s in {"na", "nan", ""}:
+        return "—" if allow_dash else ""
+    s = re.sub(r"[,\s]", "", s)
+    try:
+        return f"{float(s):.{decimals}f}"
+    except:
+        return s  # last resort: show raw
 
+def _get(p, *keys):
+    for k in keys:
+        if k in p and p[k] is not None:
+            return p[k]
+    return None
+
+# ----- TradingView webhook -----
 @app.post("/tv")
 def tv_webhook():
+    """
+    Accepts a JSON body from TradingView.
+    We compare 'secret', format all TA fields, and push to Telegram.
+    """
     try:
-        ensure_initialized_once()
-        payload = request.get_json(force=True, silent=True)
-        if not payload:
-            return "no json", 400
+        raw = request.get_data(as_text=True) or ""
+        logger.info("Incoming /tv: %s", raw[:500])
 
-        # Basic auth via shared secret inside the JSON
-        secret = os.environ.get("ALERT_SECRET")
-        if not secret or payload.get("secret") != secret:
+        # Parse JSON (return 400 if invalid)
+        try:
+            payload = json.loads(raw)
+        except Exception as e:
+            return f"bad json: {e}", 400
+
+        # Secret check (return 401 if wrong)
+        if not ALERT_SECRET or payload.get("secret") != ALERT_SECRET:
             return "unauthorized", 401
 
-        # Extract fields (tolerant to missing keys)
-        symbol = payload.get("symbol", "UNKNOWN")
-        tf = payload.get("timeframe", "NA")
-        price = payload.get("price")
-        rsi = payload.get("rsi")
-        macd = payload.get("macd")
-        macdsig = payload.get("macd_signal")
-        macdhist = payload.get("macd_hist")
-        ema20 = payload.get("ema20")
-        ema50 = payload.get("ema50")
-        atr = payload.get("atr")
-        note = payload.get("note", "")
+        # Extract fields (everything is optional; we format what we have)
+        symbol = _get(payload, "symbol") or "UNKNOWN"
+        tf     = str(_get(payload, "timeframe") or "NA").upper()
 
+        price  = _get(payload, "price")
+        vol    = _get(payload, "volume")
+
+        rsi    = _get(payload, "rsi")
+
+        ema20  = _get(payload, "ema20", "ema_fast")
+        ema50  = _get(payload, "ema50", "ema_slow")
+        ema100 = _get(payload, "ema100")
+        ema200 = _get(payload, "ema200")
+        sma200 = _get(payload, "sma200")
+
+        macd   = _get(payload, "macd")
+        macds  = _get(payload, "macd_signal")
+        macdh  = _get(payload, "macd_hist")
+
+        adx    = _get(payload, "adx")
+        diplus = _get(payload, "di_plus")
+        dimin  = _get(payload, "di_minus")
+
+        bbu    = _get(payload, "bb_upper")
+        bbl    = _get(payload, "bb_lower")
+        bbw    = _get(payload, "bb_width")
+
+        atr    = _get(payload, "atr")
+        obv    = _get(payload, "obv")
+
+        swh    = _get(payload, "swing_high")
+        swl    = _get(payload, "swing_low")
+
+        note   = str(_get(payload, "note") or "")
+
+        # Quick trend read from ADX/DI (nice to have)
+        def trend_read(adx_val, di_p, di_m):
+            try:
+                adx_f = float(adx_val); dip = float(di_p); dim = float(di_m)
+            except:
+                return "—"
+            if adx_f >= 25:
+                return "Strong Bull" if dip > dim else "Strong Bear"
+            if adx_f >= 18:
+                return "Mild Bull" if dip > dim else "Mild Bear"
+            return "Range/Weak"
+
+        # Build Telegram message (compact, all the goodies)
         msg = (
-            f"📡 *TV Alert*\n"
-            f"• Symbol: *{symbol}*  ({tf})\n"
-            f"• Price: `{price}`\n"
-            f"• RSI(14): `{rsi}`\n"
-            f"• MACD: `{macd}`  Sig: `{macdsig}`  Hist: `{macdhist}`\n"
-            f"• EMA20: `{ema20}`  EMA50: `{ema50}`\n"
-            f"• ATR: `{atr}`\n"
+            "📡 TV Alert\n"
+            f"• Symbol: {symbol}  ({tf})\n"
+            f"• Price: {_clean_num(price, 6)}  | Vol: {_clean_num(vol, 0)}\n"
+            f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}\n"
+            f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}\n"
+            f"• EMA100/200: {_clean_num(ema100,6)} / {_clean_num(ema200,6)}  | SMA200: {_clean_num(sma200,6)}\n"
+            f"• MACD: {_clean_num(macd,6)}  Sig: {_clean_num(macds,6)}  Hist: {_clean_num(macdh,6)}\n"
+            f"• ADX/DI+/DI-: {_clean_num(adx,2)} / {_clean_num(diplus,2)} / {_clean_num(dimin,2)}  ({trend_read(adx,diplus,dimin)})\n"
+            f"• BB U/L: {_clean_num(bbu,6)} / {_clean_num(bbl,6)}  | Width: {_clean_num(bbw,6)}\n"
+            f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}\n"
             f"{'• Note: ' + note if note else ''}"
         )
 
-        chat_id = int(os.environ["CHAT_ID"])
-        asyncio.run(tg_app.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN))
+        # Send to Telegram (plain HTTP)
+        if not TELEGRAM_TOKEN or not CHAT_ID:
+            logger.error("Missing TELEGRAM_TOKEN or CHAT_ID")
+            return "server misconfigured", 500
+
+        send_telegram(msg)
         return "ok", 200
+
     except Exception as e:
-        app.logger.exception("Error in /tv")
+        logger.exception("Error in /tv")
         return f"error: {e}", 500
 
-# --- Local dev runner (not used on Render) ---
+
 if __name__ == "__main__":
-    ensure_initialized_once()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
