@@ -132,6 +132,8 @@ def tv_webhook():
                 return "Mild Bull" if dip > dim else "Mild Bear"
             return "Range/Weak"
 
+        signal_tf = _get(payload, "signal_tf")
+        
         # Build Telegram message (compact, all the goodies)
         msg = (
             "📡 TV Alert\n"
