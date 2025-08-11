@@ -133,12 +133,13 @@ def tv_webhook():
             return "Range/Weak"
 
         signal_tf = _get(payload, "signal_tf")
+        chg24     = _get(payload, "change_24h")
         
         # Build Telegram message (compact, all the goodies)
         msg = (
             "📡 TV Alert\n"
-            f"• Symbol: {symbol}  ({tf})\n"
-            f"• Price: {_clean_num(price, 6)}  | Vol: {_clean_num(vol, 0)}\n"
+            f"• Symbol: {symbol}  (Signal TF: {signal_tf})\n"
+            f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%  | Vol: {_clean_num(vol, 0)}\n"
             f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}\n"
             f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}\n"
             f"• EMA100/200: {_clean_num(ema100,6)} / {_clean_num(ema200,6)}  | SMA200: {_clean_num(sma200,6)}\n"
