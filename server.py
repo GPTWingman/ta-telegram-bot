@@ -4,6 +4,8 @@
 import os, json, re, time, logging
 import requests
 from flask import Flask, request
+from decimal import Decimal, ROUND_HALF_UP
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wingman-simple")
@@ -210,6 +212,22 @@ def get_external_volume_24h(tv_symbol: str):
             return get_cmc_volume_24h_by_symbol(tv_symbol)
         return None, None
 
+def _format_price(price_raw, price_fmt, tick_str):
+    # 1) If Pine sent a tick-accurate string, use it verbatim
+    if isinstance(price_fmt, str) and price_fmt.strip():
+        return price_fmt
+    # 2) If we have tick size, quantize to that
+    try:
+        if tick_str:
+            q = Decimal(str(tick_str))
+            p = Decimal(str(price_raw))
+            return format(p.quantize(q, rounding=ROUND_HALF_UP), 'f')
+    except Exception:
+        pass
+    # 3) Fallback: show up to 8 decimals (safe for tiny memecoins)
+    return _clean_num(price_raw, 8)
+
+
 # ----- TradingView webhook -----
 @app.post("/tv")
 def tv_webhook():
@@ -237,6 +255,10 @@ def tv_webhook():
         tf     = str(_get(payload, "timeframe") or "NA").upper()
 
         price  = _get(payload, "price")
+        price_raw = _get(payload, "price")
+        price_fmt = _get(payload, "price_fmt")  # NEW
+        tick_str  = _get(payload, "tick")       # NEW
+
         vol    = _get(payload, "volume")
 
         rsi    = _get(payload, "rsi")
@@ -295,20 +317,23 @@ def tv_webhook():
         else:
             vol_line = f"Vol(TV): {_clean_num(vol, 0)}"
 
-        msg = (
-            "📡 TV Alert\n"
-            f"• Symbol: {symbol}  (Signal TF: {signal_tf})\n"
-            f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%  | {vol_line}\n"
-            f"• BTC Dom: {_clean_num(btc_dom, 2)}%  |  Alt Dom(ex-BTC): {_clean_num(alt_dom, 2)}%\n"
-            f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}\n"
-            f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}\n"
-            f"• EMA100/200: {_clean_num(ema100,6)} / {_clean_num(ema200,6)}  | SMA200: {_clean_num(sma200,6)}\n"
-            f"• MACD: {_clean_num(macd,6)}  Sig: {_clean_num(macds,6)}  Hist: {_clean_num(macdh,6)}\n"
-            f"• ADX/DI+/DI-: {_clean_num(adx,2)} / {_clean_num(diplus,2)} / {_clean_num(dimin,2)}  ({trend_read(adx,diplus,dimin)})\n"
-            f"• BB U/L: {_clean_num(bbu,6)} / {_clean_num(bbl,6)}  | Width: {_clean_num(bbw,6)}\n"
-            f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}\n"
-            f"{'• Note: ' + note if note else ''}"
-        )
+      price_display = _format_price(price_raw, price_fmt, tick_str)
+
+msg = (
+    "📡 TV Alert\n"
+    f"• Symbol: {symbol}  (Signal TF: {signal_tf})\n"
+    f"• Price: {price_display}  | 24h: {_clean_num(chg24, 2)}%  | {vol_line}\n"
+    f"• BTC Dom: {_clean_num(btc_dom, 2)}%  |  Alt Dom(ex-BTC): {_clean_num(alt_dom, 2)}%\n"
+    f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}\n"
+    f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}\n"
+    f"• EMA100/200: {_clean_num(ema100,6)} / {_clean_num(ema200,6)}  | SMA200: {_clean_num(sma200,6)}\n"
+    f"• MACD: {_clean_num(macd,6)}  Sig: {_clean_num(macds,6)}  Hist: {_clean_num(macdh,6)}\n"
+    f"• ADX/DI+/DI-: {_clean_num(adx,2)} / {_clean_num(diplus,2)} / {_clean_num(dimin,2)}  ({trend_read(adx,diplus,dimin)})\n"
+    f"• BB U/L: {_clean_num(bbu,6)} / {_clean_num(bbl,6)}  | Width: {_clean_num(bbw,6)}\n"
+    f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}\n"
+    f"{'• Note: ' + note if note else ''}"
+)
+
 
         # Send to Telegram (plain HTTP)
         if not TELEGRAM_TOKEN or not CHAT_ID:
