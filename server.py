@@ -270,6 +270,9 @@ def tv_webhook():
         signal_tf = _get(payload, "signal_tf")
         chg24     = _get(payload, "change_24h")
 
+        btc_dom = _get(payload, "btc_dom")
+        alt_dom = _get(payload, "alt_dom")
+        
         # ---- External 24h volume (USD) ----
         ext_vol, ext_units = get_external_volume_24h(symbol)
 
@@ -296,6 +299,7 @@ def tv_webhook():
             "📡 TV Alert\n"
             f"• Symbol: {symbol}  (Signal TF: {signal_tf})\n"
             f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%  | {vol_line}\n"
+            f"• BTC Dom: {_clean_num(btc_dom, 2)}%  |  Alt Dom(ex-BTC): {_clean_num(alt_dom, 2)}%\n"
             f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}\n"
             f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}\n"
             f"• EMA100/200: {_clean_num(ema100,6)} / {_clean_num(ema200,6)}  | SMA200: {_clean_num(sma200,6)}\n"
