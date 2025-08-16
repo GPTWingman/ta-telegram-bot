@@ -31,7 +31,7 @@ _ID_CACHE: dict  = {}   # base_symbol -> coingecko_id
 _CACHE_TTL       = int(os.environ.get("CACHE_TTL", "300"))  # seconds
 
 # ---------- Flask ----------
-app = Flask(_name_)
+app = Flask(__name__)
 
 # ---------- Utilities ----------
 def _clean_num(v, decimals=6, allow_dash=True):
