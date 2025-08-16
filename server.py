@@ -93,9 +93,6 @@ def _get(p, *keys):
             return p[k]
     return None
 
-btc_dom = _get(payload, "btc_dom")
-alt_dom = _get(payload, "alt_dom")
-
 # ---- External volume helpers ------------------------------------------------
 def parse_base_from_tv_symbol(tv_symbol: str) -> str:
     """
@@ -288,6 +285,9 @@ def tv_webhook():
                 return "Mild Bull" if dip > dim else "Mild Bear"
             return "Range/Weak"
 
+        btc_dom = _get(payload, "btc_dom")
+        alt_dom = _get(payload, "alt_dom")
+        
         # Build Telegram message
         # Prefer external 24h volume if available; fall back to TV volume from Pine
         if ext_vol is not None:
