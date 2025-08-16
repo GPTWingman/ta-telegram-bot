@@ -204,16 +204,35 @@ def tv_test():
     return "ok", 200
 
 def send_telegram(text: str):
+    """Send a message to Telegram, chunking if >4096 chars and logging verbosely."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.error("Missing TELEGRAM_TOKEN or CHAT_ID")
+        return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": int(CHAT_ID), "text": text}
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.ok:
-            logger.info("Telegram OK: %s", r.text[:200])
-        else:
-            logger.error("Telegram send failed: %s %s", r.status_code, r.text[:500])
-    except Exception as e:
-        logger.exception("Telegram send exception: %s", e)
+    MAXLEN = 3900  # safety margin under Telegram 4096 hard limit
+    chunks = [text[i:i+MAXLEN] for i in range(0, len(text), MAXLEN)] or [""]
+
+    all_ok = True
+    for idx, chunk in enumerate(chunks, start=1):
+        payload = {"chat_id": int(CHAT_ID), "text": chunk}
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+            logger.info("Telegram POST (%d/%d): %s", idx, len(chunks), r.status_code)
+            if not r.ok:
+                logger.error("Telegram send failed: %s %s", r.status_code, r.text[:1000])
+                all_ok = False
+            else:
+                logger.info("Telegram OK body: %s", r.text[:500])
+        except Exception as e:
+            logger.exception("Telegram send exception: %s", e)
+            all_ok = False
+    return all_ok
+
+        logger.info("Telegram message preview (len=%d): %s", len(msg), msg[:500])
+        ok = send_telegram(msg)
+        if not ok:
+            return "telegram_failed", 502
 
 @app.post("/tv")
 def tv_webhook():
@@ -221,11 +240,26 @@ def tv_webhook():
         raw = request.get_data(as_text=True) or ""
         logger.info("Incoming /tv: %s", raw[:500])
 
-        # Parse JSON
+               # Parse JSON (robust)
         try:
             payload = json.loads(raw)
-        except Exception as e:
-            return f"bad json: {e}", 400
+        except Exception as e1:
+            # Attempt common auto-fixes: strip BOM/newlines, trim after last closing brace
+            candidate = raw.strip().lstrip("\ufeff")
+            fixed = None
+            if "}" in candidate:
+                candidate2 = candidate[: candidate.rfind("}") + 1]
+                try:
+                    fixed = json.loads(candidate2)
+                except Exception:
+                    fixed = None
+            if fixed is not None:
+                logger.warning("JSON fixed by trimming after last '}'")
+                payload = fixed
+            else:
+                logger.error("bad json parse: %s\n--- first 300 ---\n%r\n--- last 300 ---\n%r",
+                             e1, raw[:300], raw[-300:])
+                return "bad json", 400
 
         # Secret check
         if not ALERT_SECRET or payload.get("secret") != ALERT_SECRET:
