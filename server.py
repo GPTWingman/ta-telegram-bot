@@ -1,5 +1,5 @@
 # server.py — Simple & stable TradingView -> Telegram forwarder
-# No async. No event loops. Just works.
+# Sync-only. No async/event loops.
 
 import os, json, re, time, logging
 import requests
@@ -9,18 +9,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wingman-simple")
 
 # ===== Env vars (set these on Render) =====
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")   # from BotFather
-CHAT_ID        = os.environ.get("CHAT_ID")          # your chat id number
-ALERT_SECRET   = os.environ.get("ALERT_SECRET")     # must match TradingView alert "secret"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")    # from BotFather
+CHAT_ID        = os.environ.get("CHAT_ID")           # your chat id number
+ALERT_SECRET   = os.environ.get("ALERT_SECRET")      # must match TradingView alert "secret"
 
 # External 24h volume source
-VOLUME_SOURCE = os.environ.get("VOLUME_SOURCE", "coingecko").lower()  # "coingecko" or "cmc"
-CMC_API_KEY   = os.environ.get("CMC_API_KEY", "")
+VOLUME_SOURCE  = os.environ.get("VOLUME_SOURCE", "coingecko").lower()  # "coingecko" or "cmc"
+CMC_API_KEY    = os.environ.get("CMC_API_KEY", "")
 
 # Simple caches to avoid rate limits
-_VOL_CACHE = {}   # key -> (value, units, ts)
-_ID_CACHE  = {}   # base_symbol -> coingecko_id
-_CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))  # seconds
+_VOL_CACHE: dict = {}   # key -> (value, units, ts)
+_ID_CACHE:  dict = {}   # base_symbol -> coingecko_id
+_CACHE_TTL  = int(os.environ.get("CACHE_TTL", "300"))  # seconds
 
 app = Flask(__name__)
 
@@ -37,7 +37,7 @@ def tv_test():
     send_telegram("✅ Test OK\nService is alive.")
     return "ok", 200
 
-# ----- Helper functions -----
+# ----- Telegram helper -----
 def send_telegram(text: str):
     """Send a message to Telegram using the Bot API (plain HTTP)."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -51,14 +51,15 @@ def send_telegram(text: str):
     except Exception as e:
         logger.exception("Telegram send exception: %s", e)
 
+# ----- Utilities -----
 def _clean_num(v, decimals=6, allow_dash=True):
-    """Turn strings like 'na', '', ' 1,234.5 ' into nice numbers; or '—'."""
+    """Format numbers safely (handles 'na', None, strings)."""
     if v is None:
         return "—" if allow_dash else ""
     if isinstance(v, (int, float)):
         try:
             return f"{float(v):.{decimals}f}"
-        except:
+        except Exception:
             return "—" if allow_dash else ""
     s = str(v).strip().lower()
     if s in {"na", "nan", ""}:
@@ -66,14 +67,14 @@ def _clean_num(v, decimals=6, allow_dash=True):
     s = re.sub(r"[,\s]", "", s)
     try:
         return f"{float(s):.{decimals}f}"
-    except:
+    except Exception:
         return s  # last resort: show raw
 
 def _abbr(v):
-    """Abbreviate big numbers: 1234 -> 1.23K, 1_234_567 -> 1.23M. Returns '—' for NA."""
+    """Abbreviate big numbers: 1_234 -> 1.23K, 1_234_567 -> 1.23M. '—' if NA."""
     try:
         n = float(v)
-    except:
+    except Exception:
         return "—"
     sign = "-" if n < 0 else ""
     n = abs(n)
@@ -93,7 +94,7 @@ def _get(p, *keys):
             return p[k]
     return None
 
-# ---- External volume helpers ------------------------------------------------
+# ---- Symbol parsing & external data helpers -------------------------------
 def parse_base_from_tv_symbol(tv_symbol: str) -> str:
     """
     Extract base asset from TV symbol like 'BINANCE:BTCUSDT', 'HTX:PYTHUSDT', 'SOLUSD.P'
@@ -110,7 +111,7 @@ def parse_base_from_tv_symbol(tv_symbol: str) -> str:
     return m.group(1) if m else s
 
 def cg_resolve_id(base_symbol: str):
-    # cached?
+    """Resolve a symbol like 'BTC' -> 'bitcoin' using CoinGecko /search (cached)."""
     if base_symbol in _ID_CACHE:
         return _ID_CACHE[base_symbol]
     try:
@@ -122,7 +123,7 @@ def cg_resolve_id(base_symbol: str):
         r.raise_for_status()
         items = r.json().get("coins", [])
         # Prefer exact symbol match, else best ranked
-        candidates = [c for c in items if c.get("symbol","").lower() == base_symbol.lower()]
+        candidates = [c for c in items if c.get("symbol", "").lower() == base_symbol.lower()]
         if not candidates:
             candidates = items
         if not candidates:
@@ -210,6 +211,20 @@ def get_external_volume_24h(tv_symbol: str):
             return get_cmc_volume_24h_by_symbol(tv_symbol)
         return None, None
 
+def get_global_dominance():
+    """Fallback for BTC & Alt dominance from CoinGecko /global."""
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10)
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        m = data.get("market_cap_percentage", {})
+        btc = m.get("btc")
+        alt = 100 - btc if isinstance(btc, (int, float)) else None
+        return btc, alt
+    except Exception as e:
+        logger.warning("get_global_dominance error: %s", e)
+        return None, None
+
 # ----- TradingView webhook -----
 @app.post("/tv")
 def tv_webhook():
@@ -233,14 +248,17 @@ def tv_webhook():
             return "unauthorized", 401
 
         # Extract fields (everything is optional; we format what we have)
-        symbol = _get(payload, "symbol") or "UNKNOWN"
-        tf     = str(_get(payload, "timeframe") or "NA").upper()
+        symbol    = _get(payload, "symbol") or "UNKNOWN"   # Pine sends syminfo.tickerid
+        signal_tf = _get(payload, "signal_tf")
 
         price  = _get(payload, "price")
-        vol    = _get(payload, "volume")
+        chg24  = _get(payload, "change_24h")
+
+        # Local/chart volume sent by Pine (for fallback or comparison)
+        vol_local = _get(payload, "volume")
+        vol_mode  = _get(payload, "vol_mode")
 
         rsi    = _get(payload, "rsi")
-
         ema20  = _get(payload, "ema20", "ema_fast")
         ema50  = _get(payload, "ema50", "ema_slow")
         ema100 = _get(payload, "ema100")
@@ -265,10 +283,15 @@ def tv_webhook():
         swh    = _get(payload, "swing_high", "swing_high_last")
         swl    = _get(payload, "swing_low",  "swing_low_last")
 
-        note   = str(_get(payload, "note") or "")
+        # Dominance (prefer values from Pine, else fallback to CG global)
+        btc_dom = _get(payload, "btc_dom")
+        alt_dom = _get(payload, "alt_dom")
+        if btc_dom is None or alt_dom is None:
+            cg_btc, cg_alt = get_global_dominance()
+            if btc_dom is None: btc_dom = cg_btc
+            if alt_dom is None: alt_dom = cg_alt
 
-        signal_tf = _get(payload, "signal_tf")
-        chg24     = _get(payload, "change_24h")
+        note   = str(_get(payload, "note") or "")
 
         # ---- External 24h volume (USD) ----
         ext_vol, ext_units = get_external_volume_24h(symbol)
@@ -277,7 +300,7 @@ def tv_webhook():
         def trend_read(adx_val, di_p, di_m):
             try:
                 adx_f = float(adx_val); dip = float(di_p); dim = float(di_m)
-            except:
+            except Exception:
                 return "—"
             if adx_f >= 25:
                 return "Strong Bull" if dip > dim else "Strong Bear"
@@ -285,16 +308,14 @@ def tv_webhook():
                 return "Mild Bull" if dip > dim else "Mild Bear"
             return "Range/Weak"
 
-        btc_dom = _get(payload, "btc_dom")
-        alt_dom = _get(payload, "alt_dom")
-        
-        # Build Telegram message
-        # Prefer external 24h volume if available; fall back to TV volume from Pine
+        # Prefer external 24h volume; fallback to Pine's local choice
         if ext_vol is not None:
             vol_line = f"Vol(24h ext): {_abbr(ext_vol)} {ext_units}"
         else:
-            vol_line = f"Vol(TV): {_clean_num(vol, 0)}"
+            label = f"Vol({vol_mode or 'TF'})"
+            vol_line = f"{label}: {_clean_num(vol_local, 0)}"
 
+        # Build Telegram message
         msg = (
             "📡 TV Alert\n"
             f"• Symbol: {symbol}  (Signal TF: {signal_tf})\n"
@@ -325,4 +346,5 @@ def tv_webhook():
 
 
 if __name__ == "__main__":
+    # Render sets PORT env var. Defaults to 8000 locally.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
