@@ -1,37 +1,44 @@
-# server.py — TradingView -> Telegram with venue 24h volume
-import os, json, re, logging
+# server.py — TradingView -> Telegram with 24h Volume preference:
+# 1) CoinGecko, 2) Venue (Binance/Coinbase/HTX/Bybit/Bitunix), 3) TV fallbacks.
+import os, json, re, time, logging
 import requests
 from flask import Flask, request
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("wingman-volfix")
+logger = logging.getLogger("wingman-vol-order")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = os.environ.get("CHAT_ID")
 ALERT_SECRET   = os.environ.get("ALERT_SECRET")
 
-HTTP_TIMEOUT = 7
+HTTP_TIMEOUT = 8
+CACHE_TTL    = int(os.environ.get("CACHE_TTL", "300"))  # seconds
+
+# Simple caches
+_ID_CACHE  = {}  # {base_symbol: coingecko_id}
+_VOL_CACHE = {}  # {key_tuple: (value, ts)}
 
 app = Flask(__name__)
 
-# ----------------- helpers -----------------
+# ----------------- Telegram -----------------
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": int(CHAT_ID), "text": text}
     try:
         r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
         if not r.ok:
-            logger.error("Telegram send failed: %s %s", r.status_code, r.text)
+            logger.error("Telegram send failed: %s %s", r.status_code, r.text[:500])
     except Exception as e:
         logger.exception("Telegram send exception: %s", e)
 
+# ----------------- Utils -----------------
 def _clean_num(v, decimals=6, allow_dash=True):
     if v is None:
         return "—" if allow_dash else ""
     if isinstance(v, (int, float)):
         try:
             return f"{float(v):.{decimals}f}"
-        except:
+        except Exception:
             return "—" if allow_dash else ""
     s = str(v).strip().lower()
     if s in {"na", "nan", ""}:
@@ -39,8 +46,21 @@ def _clean_num(v, decimals=6, allow_dash=True):
     s = re.sub(r"[,\s]", "", s)
     try:
         return f"{float(s):.{decimals}f}"
-    except:
+    except Exception:
         return s
+
+def _abbr(v):
+    try:
+        n = float(v)
+    except Exception:
+        return "—"
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    if n >= 1_000_000_000_000: return f"{sign}{n/1_000_000_000_000:.2f}T"
+    if n >= 1_000_000_000:     return f"{sign}{n/1_000_000_000:.2f}B"
+    if n >= 1_000_000:         return f"{sign}{n/1_000_000:.2f}M"
+    if n >= 1_000:             return f"{sign}{n/1_000:.2f}K"
+    return f"{sign}{n:.0f}"
 
 def _get(p, *keys):
     for k in keys:
@@ -50,10 +70,9 @@ def _get(p, *keys):
 
 def parse_tv_symbol(tv_symbol: str):
     """
-    TradingView symbol format examples:
-      'BINANCE:BTCUSDT', 'HTX:PYTHUSDT', 'BYBIT:SOLUSDT.P', 'OKX:BTC-USDT'
-    We try to normalize venue and pair for APIs.
-    Returns: venue(str|None), base(str|None), quote(str|None), raw_pair(str)
+    TradingView formats: 'BINANCE:BTCUSDT', 'COINBASE:BTCUSD', 'HTX:PYTHUSDT',
+                         'BYBIT:SOLUSDT.P', 'BITUNIX:BTCUSDT', etc.
+    Returns: venue, base, quote, normalized_pair
     """
     if not tv_symbol:
         return None, None, None, ""
@@ -61,103 +80,178 @@ def parse_tv_symbol(tv_symbol: str):
     venue = parts[0].upper() if len(parts) >= 2 else None
     pair_raw = parts[-1]
 
-    # Normalize common separators/suffixes
+    # Normalize: remove dash/slash, strip common derivatives suffixes
     pair_norm = pair_raw.replace("-", "").replace("/", "")
-    # Strip common derivatives suffixes like .P
     pair_norm = pair_norm.replace(".P", "").replace("_PERP", "").replace("-PERP", "")
 
-    # Guess base/quote by common quotes
-    quotes = ["USDT", "USD", "USDC", "BTC", "ETH", "FDUSD", "BUSD", "EUR", "TRY"]
+    # Guess base/quote
+    QUOTES = ["USDT", "USD", "USDC", "FDUSD", "BUSD", "TUSD", "EUR", "TRY", "BTC", "ETH"]
     base, quote = None, None
-    for q in quotes:
-        if pair_norm.endswith(q):
+    for q in QUOTES:
+        if pair_norm.endswith(q) and len(pair_norm) > len(q):
             base = pair_norm[:-len(q)]
             quote = q
             break
     return venue, base, quote, pair_norm
 
-# --------------- venue volume fetchers ---------------
-def fetch_binance_24h_quote_volume(symbol_pair: str):
-    """
-    symbol_pair: e.g., 'BTCUSDT'
-    Returns (quote_volume_float or None)
-    """
+# ----------------- CoinGecko (primary) -----------------
+def cg_resolve_id(base_symbol: str):
+    if not base_symbol:
+        return None
+    if base_symbol in _ID_CACHE:
+        return _ID_CACHE[base_symbol]
     try:
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        r = requests.get(url, params={"symbol": symbol_pair.upper()}, timeout=HTTP_TIMEOUT)
-        if r.ok:
-            data = r.json()
-            # Binance returns 'quoteVolume' (string) for spot
-            qv = data.get("quoteVolume")
-            return float(qv) if qv is not None else None
-        logger.error("Binance 24hr failed %s %s", r.status_code, r.text)
+        r = requests.get("https://api.coingecko.com/api/v3/search",
+                         params={"query": base_symbol}, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        coins = r.json().get("coins", [])
+        # Prefer exact symbol match; fall back to first by market cap rank
+        exact = [c for c in coins if c.get("symbol","").lower() == base_symbol.lower()]
+        cand = exact or coins
+        if not cand:
+            return None
+        best = sorted(cand, key=lambda c: (c.get("market_cap_rank") or 1e9))[0]
+        coin_id = best.get("id")
+        if coin_id:
+            _ID_CACHE[base_symbol] = coin_id
+            return coin_id
     except Exception as e:
-        logger.exception("Binance 24hr exception: %s", e)
+        logger.warning("cg_resolve_id error for %s: %s", base_symbol, e)
     return None
 
-def fetch_htx_24h_quote_and_base(symbol_pair_lower: str):
-    """
-    HTX/Huobi spot:
-      GET /market/detail/merged?symbol=btcusdt
-      tick.vol   -> quote volume (24h rolling)
-      tick.amount-> base  volume (24h rolling)
-    Returns (quote_volume_float or None, base_volume_float or None)
-    """
+def get_coingecko_volume_24h_by_symbol(tv_symbol: str):
+    venue, base, quote, _ = parse_tv_symbol(tv_symbol)
+    if not base:
+        return None
+    cache_key = ("cg", base.lower())
+    now = time.time()
+    if cache_key in _VOL_CACHE and now - _VOL_CACHE[cache_key][1] < CACHE_TTL:
+        return _VOL_CACHE[cache_key][0]
+    coin_id = cg_resolve_id(base)
+    if not coin_id:
+        return None
     try:
-        url = "https://api.huobi.pro/market/detail/merged"
-        r = requests.get(url, params={"symbol": symbol_pair_lower}, timeout=HTTP_TIMEOUT)
-        if r.ok:
-            data = r.json()
-            tick = data.get("tick") or {}
-            vol_q = tick.get("vol")      # quote
-            vol_b = tick.get("amount")   # base
-            q = float(vol_q) if vol_q is not None else None
-            b = float(vol_b) if vol_b is not None else None
-            return q, b
-        logger.error("HTX 24h failed %s %s", r.status_code, r.text)
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={"vs_currency": "usd", "ids": coin_id, "sparkline": "false"},
+            timeout=HTTP_TIMEOUT,
+        )
+        r.raise_for_status()
+        arr = r.json()
+        if not arr:
+            return None
+        vol_usd = arr[0].get("total_volume")
+        if isinstance(vol_usd, (int, float)):
+            _VOL_CACHE[cache_key] = (vol_usd, now)
+            return vol_usd
     except Exception as e:
-        logger.exception("HTX 24hr exception: %s", e)
+        logger.warning("get_coingecko_volume_24h_by_symbol error: %s", e)
+    return None
+
+# ----------------- Venue APIs (secondary) -----------------
+def fetch_binance_24h_quote_volume(pair_no_dash: str):
+    # e.g., BTCUSDT
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/24hr",
+                         params={"symbol": pair_no_dash.upper()},
+                         timeout=HTTP_TIMEOUT)
+        if r.ok:
+            qv = r.json().get("quoteVolume")
+            return float(qv) if qv is not None else None
+    except Exception as e:
+        logger.warning("Binance 24hr error: %s", e)
+    return None
+
+def fetch_htx_24h_quote_volume(pair_lower: str):
+    # e.g., btcusdt
+    try:
+        r = requests.get("https://api.huobi.pro/market/detail/merged",
+                         params={"symbol": pair_lower}, timeout=HTTP_TIMEOUT)
+        if r.ok:
+            tick = (r.json() or {}).get("tick") or {}
+            vol_q = tick.get("vol")  # quote volume (24h)
+            return float(vol_q) if vol_q is not None else None
+    except Exception as e:
+        logger.warning("HTX 24hr error: %s", e)
+    return None
+
+def fetch_coinbase_24h_quote_volume(base: str, quote: str):
+    # Coinbase /stats returns 24h base 'volume'; convert to quote using last price for USD/USDT/USDC pairs.
+    product = f"{base}-{quote}"
+    try:
+        s = requests.get(f"https://api.exchange.coinbase.com/products/{product}/stats",
+                         timeout=HTTP_TIMEOUT)
+        if not s.ok:
+            return None
+        stats = s.json()
+        vol_base = stats.get("volume")
+        last = stats.get("last")
+        if vol_base is None or last is None:
+            return None
+        return float(vol_base) * float(last)
+    except Exception as e:
+        logger.warning("Coinbase stats error: %s", e)
+    return None
+
+def fetch_bybit_24h_quote_volume(pair_no_dash: str):
+    # Try spot first, then linear (USDT perp); both return turnover24h in quote currency.
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers",
+                         params={"category": "spot", "symbol": pair_no_dash.upper()},
+                         timeout=HTTP_TIMEOUT)
+        if r.ok:
+            arr = (r.json() or {}).get("result", {}).get("list", [])
+            if arr:
+                t = arr[0].get("turnover24h")
+                return float(t) if t is not None else None
+    except Exception as e:
+        logger.warning("Bybit spot error: %s", e)
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers",
+                         params={"category": "linear", "symbol": pair_no_dash.upper()},
+                         timeout=HTTP_TIMEOUT)
+        if r.ok:
+            arr = (r.json() or {}).get("result", {}).get("list", [])
+            if arr:
+                t = arr[0].get("turnover24h")
+                return float(t) if t is not None else None
+    except Exception as e:
+        logger.warning("Bybit linear error: %s", e)
+    return None
+
+def fetch_bitunix_24h_quote_volume(pair_no_dash: str):
+    # TODO: Bitunix public endpoint not confirmed; return None to fall back cleanly.
+    logger.info("Bitunix 24h volume not implemented; skipping.")
+    return None
+
+def get_venue_volume_24h(tv_symbol: str):
+    venue, base, quote, pair_norm = parse_tv_symbol(tv_symbol)
+    if not venue or not base or not quote:
+        return None, None
+    # Venue-specific
+    if venue == "BINANCE":
+        v = fetch_binance_24h_quote_volume(base + quote)
+        return v, "exch:BINANCE" if v is not None else (None, None)
+    if venue in {"HTX", "HUOBI"}:
+        v = fetch_htx_24h_quote_volume((base + quote).lower())
+        return v, "exch:HTX" if v is not None else (None, None)
+    if venue == "COINBASE":
+        # Coinbase uses dash product ids
+        v = fetch_coinbase_24h_quote_volume(base, quote)
+        return v, "exch:COINBASE" if v is not None else (None, None)
+    if venue == "BYBIT":
+        v = fetch_bybit_24h_quote_volume(base + quote)
+        return v, "exch:BYBIT" if v is not None else (None, None)
+    if venue == "BITUNIX":
+        v = fetch_bitunix_24h_quote_volume(base + quote)
+        return v, "exch:BITUNIX" if v is not None else (None, None)
     return None, None
 
-def best_24h_volume(symbol_tv: str, payload: dict):
-    """
-    Try venue official 24h quote volume first, then TV 'vol24h_quote_tv', then TV 'volume'.
-    Returns (value_float_or_None, source_label_str).
-    """
-    venue, base, quote, pair_norm = parse_tv_symbol(symbol_tv)
-
-    # 1) Venue APIs
-    if venue == "BINANCE" and base and quote:
-        v = fetch_binance_24h_quote_volume(base + quote)
-        if v is not None:
-            return v, "exch(BINANCE, quote)"
-    if venue in {"HTX", "HUOBI"} and base and quote:
-        vq, vb = fetch_htx_24h_quote_and_base((base + quote).lower())
-        if vq is not None:
-            return vq, "exch(HTX, quote)"
-        if vb is not None:
-            # As a fallback we could convert base->quote by last price if desired.
-            return vb, "exch(HTX, base)"
-
-    # 2) TradingView “Vol(24h TV close)” from Pine (quote)
-    tv_quote = _get(payload, "vol24h_quote_tv")
-    if tv_quote is not None:
-        try:
-            return float(tv_quote), "tv(close, quote)"
-        except:
-            pass
-
-    # 3) Whatever 'volume' the Pine sent (could be TF bar or D bar)
-    v_any = _get(payload, "volume")
-    try:
-        return float(v_any), "tv(volume)"
-    except:
-        return None, "na"
-
+# ----------------- Trend label -----------------
 def trend_read(adx_val, di_p, di_m):
     try:
         adx_f = float(adx_val); dip = float(di_p); dim = float(di_m)
-    except:
+    except Exception:
         return "—"
     if adx_f >= 25:
         return "Strong Bull" if dip > dim else "Strong Bear"
@@ -165,7 +259,7 @@ def trend_read(adx_val, di_p, di_m):
         return "Mild Bull" if dip > dim else "Mild Bear"
     return "Range/Weak"
 
-# ----------------- routes -----------------
+# ----------------- Routes -----------------
 @app.get("/health")
 def health():
     return "ok", 200
@@ -191,6 +285,7 @@ def tv_webhook():
         if not ALERT_SECRET or payload.get("secret") != ALERT_SECRET:
             return "unauthorized", 401
 
+        # --- Extract core fields ---
         symbol = _get(payload, "symbol") or "UNKNOWN"
         tf     = str(_get(payload, "signal_tf") or _get(payload, "timeframe") or "NA").upper()
 
@@ -211,25 +306,52 @@ def tv_webhook():
         swh    = _get(payload, "swing_high");  swl = _get(payload, "swing_low")
         hiDate = _get(payload, "swing_high_date"); loDate = _get(payload, "swing_low_date")
 
-        vol24_base_tv  = _get(payload, "vol24h_base_tv")
-        vol24_quote_tv = _get(payload, "vol24h_quote_tv")
+        # TV-provided volume fields (fallbacks)
+        vol_tv_close_quote = _get(payload, "vol24h_quote_tv")
+        vol_tv_close_base  = _get(payload, "vol24h_base_tv")
+        vol_local          = _get(payload, "volume")
+        vol_mode           = _get(payload, "vol_mode")
 
-        note   = str(_get(payload, "note") or "")
+        # --- 24h Volume selection ---
+        # 1) CoinGecko (USD)
+        vol_cg = get_coingecko_volume_24h_by_symbol(symbol)
+        vol_value = None
+        vol_src   = None
+        if isinstance(vol_cg, (int, float)):
+            vol_value = vol_cg
+            vol_src   = "cg"
 
-        # New: venue 24h volume (quote) if available
-        vol24_exch, vol_src = best_24h_volume(symbol, payload)
+        # 2) Venue (if CoinGecko missing)
+        if vol_value is None:
+            v_exch, src = get_venue_volume_24h(symbol)
+            if v_exch is not None:
+                vol_value = v_exch
+                vol_src   = src
 
-        # Build message
+        # 3) TV fallbacks (close-quote -> close-base -> local)
+        if vol_value is None and vol_tv_close_quote is not None:
+            try:
+                vol_value = float(vol_tv_close_quote)
+                vol_src   = "tv:close-quote"
+            except: pass
+        if vol_value is None and vol_tv_close_base is not None:
+            try:
+                vol_value = float(vol_tv_close_base)
+                vol_src   = "tv:close-base"
+            except: pass
+        if vol_value is None and vol_local is not None:
+            try:
+                vol_value = float(vol_local)
+                vol_src   = f"tv:{vol_mode or 'volume'}"
+            except: pass
+
+        # --- Build Telegram message ---
         lines = []
         lines.append("📡 TV Alert")
         lines.append(f"• Symbol: {symbol}  (Signal TF: {tf})")
-        vol_line = f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%"
 
-        if vol24_exch is not None:
-            vol_line += f"  | Vol(24h exch): {_clean_num(vol24_exch, 0)}"
-        elif vol24_quote_tv is not None or vol24_base_tv is not None:
-            vol_line += f"  | Vol(24h TV close): {_clean_num(vol24_quote_tv or vol24_base_tv, 0)}"
-        lines.append(vol_line + f"  [{vol_src}]")
+        vol_display = f"{_abbr(vol_value)}" if vol_value is not None else "—"
+        lines.append(f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%  | Vol(24h): {vol_display}  [{vol_src or 'na'}]")
 
         lines.append(f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}")
         lines.append(f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}")
@@ -237,9 +359,11 @@ def tv_webhook():
         lines.append(f"• MACD: {_clean_num(macd,6)}  Sig: {_clean_num(macds,6)}  Hist: {_clean_num(macdh,6)}")
         lines.append(f"• ADX/DI+/DI-: {_clean_num(adx,2)} / {_clean_num(diplus,2)} / {_clean_num(dimin,2)}  ({trend_read(adx,diplus,dimin)})")
         lines.append(f"• BB U/L: {_clean_num(bbu,6)} / {_clean_num(bbl,6)}  | Width: {_clean_num(bbw,6)}")
-        lines.append(f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}")
-                     #+ (f"  | Dates: {hiDate or '—'} / {loDate or '—'}" if (hiDate or loDate) else ""))
+        if swh is not None or swl is not None or hiDate or loDate:
+            lines.append(f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}")
+                         #+ (f"  | Dates: {hiDate or '—'} / {loDate or '—'}" if (hiDate or loDate) else ""))
 
+        note = _get(payload, "note")
         if note:
             lines.append(f"• Note: {note}")
 
@@ -256,5 +380,6 @@ def tv_webhook():
         logger.exception("Error in /tv")
         return f"error: {e}", 500
 
+# ----------------- Boot -----------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
