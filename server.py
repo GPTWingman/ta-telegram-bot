@@ -346,26 +346,21 @@ def tv_webhook():
             except: pass
 
         # --- Build Telegram message ---
-        lines = []
-        lines.append("📡 TV Alert")
-        lines.append(f"• Symbol: {symbol}  (Signal TF: {tf})")
+         msg = (
+            "📡 TV Alert\n"
+            f"• Symbol: {symbol}  (Signal TF: {signal_tf})\n"
+            f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%  | {vol_line}\n"
+            f"• BTC Dom: {_clean_num(btc_dom, 2)}%  |  Alt Dom(ex-BTC): {_clean_num(alt_dom, 2)}%\n"
+            f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}\n"
+            f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}\n"
+            f"• EMA100/200: {_clean_num(ema100,6)} / {_clean_num(ema200,6)}  | SMA200: {_clean_num(sma200,6)}\n"
+            f"• MACD: {_clean_num(macd,6)}  Sig: {_clean_num(macds,6)}  Hist: {_clean_num(macdh,6)}\n"
+            f"• ADX/DI+/DI-: {_clean_num(adx,2)} / {_clean_num(diplus,2)} / {_clean_num(dimin,2)}  ({trend_read(adx,diplus,dimin)})\n"
+            f"• BB U/L: {_clean_num(bbu,6)} / {_clean_num(bbl,6)}  | Width: {_clean_num(bbw,6)}\n"
+            f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}\n"
+            f"{'• Note: ' + note if note else ''}"
+        )
 
-        vol_display = f"{_abbr(vol_value)}" if vol_value is not None else "—"
-        lines.append(f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%  | Vol(24h): {vol_display}  [{vol_src or 'na'}]")
-
-        lines.append(f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}")
-        lines.append(f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}")
-        lines.append(f"• EMA100/200: {_clean_num(ema100,6)} / {_clean_num(ema200,6)}  | SMA200: {_clean_num(sma200,6)}")
-        lines.append(f"• MACD: {_clean_num(macd,6)}  Sig: {_clean_num(macds,6)}  Hist: {_clean_num(macdh,6)}")
-        lines.append(f"• ADX/DI+/DI-: {_clean_num(adx,2)} / {_clean_num(diplus,2)} / {_clean_num(dimin,2)}  ({trend_read(adx,diplus,dimin)})")
-        lines.append(f"• BB U/L: {_clean_num(bbu,6)} / {_clean_num(bbl,6)}  | Width: {_clean_num(bbw,6)}")
-        lines.append(f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}"
-                       
-        note = _get(payload, "note")
-        if note:
-            lines.append(f"• Note: {note}")
-
-        msg = "\n".join(lines)
 
         if not TELEGRAM_TOKEN or not CHAT_ID:
             logger.error("Missing TELEGRAM_TOKEN or CHAT_ID")
