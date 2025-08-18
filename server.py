@@ -359,10 +359,8 @@ def tv_webhook():
         lines.append(f"• MACD: {_clean_num(macd,6)}  Sig: {_clean_num(macds,6)}  Hist: {_clean_num(macdh,6)}")
         lines.append(f"• ADX/DI+/DI-: {_clean_num(adx,2)} / {_clean_num(diplus,2)} / {_clean_num(dimin,2)}  ({trend_read(adx,diplus,dimin)})")
         lines.append(f"• BB U/L: {_clean_num(bbu,6)} / {_clean_num(bbl,6)}  | Width: {_clean_num(bbw,6)}")
-        if swh is not None or swl is not None or hiDate or loDate:
-            lines.append(f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}"
-                         + (f"  | Dates: {hiDate or '—'} / {loDate or '—'}" if (hiDate or loDate) else ""))
-
+        lines.append(f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}"
+                       
         note = _get(payload, "note")
         if note:
             lines.append(f"• Note: {note}")
