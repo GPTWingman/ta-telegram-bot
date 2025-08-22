@@ -345,6 +345,9 @@ def tv_webhook():
                 vol_src   = f"tv:{vol_mode or 'volume'}"
             except: pass
 
+        btc_dom = _get(payload, "btc_dom")
+        alt_dom = _get(payload, "alt_dom")
+        
         # --- Build Telegram message ---
         lines = []
         lines.append("📡 TV Alert")
