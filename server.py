@@ -352,7 +352,7 @@ def tv_webhook():
 
         vol_display = f"{_abbr(vol_value)}" if vol_value is not None else "—"
         lines.append(f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%  | Vol(24h): {vol_display}  [{vol_src or 'na'}]")
-
+        lines.append(f"• BTC Dom: {_clean_num(btc_dom, 2)}%  |  Alt Dom(ex-BTC): {_clean_num(alt_dom, 2)}%")
         lines.append(f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}")
         lines.append(f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}")
         lines.append(f"• EMA100/200: {_clean_num(ema100,6)} / {_clean_num(ema200,6)}  | SMA200: {_clean_num(sma200,6)}")
