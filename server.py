@@ -368,14 +368,13 @@ def tv_webhook():
                 vol_value = float(vol_local);          vol_src = f"tv:{vol_mode or 'volume'}"
             except: pass
 
-        # --- Build Telegram message ---
+          # --- Build Telegram message ---
         lines = []
         lines.append("📡 TV Alert")
         lines.append(f"• Symbol: {symbol}  (Signal TF: {tf})")
-        vol_display = _abbr(vol_value) if vol_value is not None else "—"
-        lines.append(f"• Price: {price_text}  | 24h: {_clean_num(chg24, 2)}%  | Vol(24h): {vol_display}  [{vol_src or 'na'}]")
-        if btc_dom is not None or alt_dom is not None:
-            lines.append(f"• BTC Dom: {_clean_num(btc_dom, 2)}%  |  Alt Dom(ex-BTC): {_clean_num(alt_dom, 2)}%")
+
+        vol_display = f"{_abbr(vol_value)}" if vol_value is not None else "—"
+        lines.append(f"• Price: {_clean_num(price, 6)}  | 24h: {_clean_num(chg24, 2)}%  | Vol(24h): {vol_display}  [{vol_src or 'na'}]")
 
         lines.append(f"• RSI(14): {_clean_num(rsi, 2)}  | ATR: {_clean_num(atr, 6)}")
         lines.append(f"• EMA20/50: {_clean_num(ema20,6)} / {_clean_num(ema50,6)}")
@@ -383,16 +382,9 @@ def tv_webhook():
         lines.append(f"• MACD: {_clean_num(macd,6)}  Sig: {_clean_num(macds,6)}  Hist: {_clean_num(macdh,6)}")
         lines.append(f"• ADX/DI+/DI-: {_clean_num(adx,2)} / {_clean_num(diplus,2)} / {_clean_num(dimin,2)}  ({trend_read(adx,diplus,dimin)})")
         lines.append(f"• BB U/L: {_clean_num(bbu,6)} / {_clean_num(bbl,6)}  | Width: {_clean_num(bbw,6)}")
-
-        # Pivots (merged + details)
-        if swh is not None or swl is not None:
-            lines.append(f"• Swing H/L (Merged): {_clean_num(swh,6)} / {_clean_num(swl,6)}"
-                         + (f"  | Dates: {hiDate or '—'} / {loDate or '—'}" if (hiDate or loDate) else ""))
-        if any(x is not None for x in (swhA, swlA, swhB, swlB)):
-            lines.append(f"• Pivots A: H/L {_clean_num(swhA,6)} / {_clean_num(swlA,6)}"
-                         + (f"  ({hiDateA or '—'} / {loDateA or '—'})" if (hiDateA or loDateA) else ""))
-            lines.append(f"• Pivots B: H/L {_clean_num(swhB,6)} / {_clean_num(swlB,6)}"
-                         + (f"  ({hiDateB or '—'} / {loDateB or '—'})" if (hiDateB or loDateB) else ""))
+        if swh is not None or swl is not None or hiDate or loDate:
+            lines.append(f"• Swing H/L: {_clean_num(swh,6)} / {_clean_num(swl,6)}")
+                         #+ (f"  | Dates: {hiDate or '—'} / {loDate or '—'}" if (hiDate or loDate) else ""))
 
         note = _get(payload, "note")
         if note:
@@ -411,6 +403,6 @@ def tv_webhook():
         logger.exception("Error in /tv")
         return f"error: {e}", 500
 
-# ---------- Boot ----------
+# ----------------- Boot -----------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
